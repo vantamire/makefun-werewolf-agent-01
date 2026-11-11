@@ -8,21 +8,31 @@
 // Strategy, per role:
 //   - every role keeps a suspicion score for each living seat, built from the
 //     public log: votes and accusations aimed at players whose roles were later
-//     revealed, and seer claims that turned out true or false. A seer result of
-//     our own is proof and outranks everything.
-//   - werewolf: kill the most dangerous villager (a seer claimant first, then
-//     players accusing us or our partner), and always agree with the partner's
+//     revealed, and seer claims judged against revealed roles (a wolf call
+//     that landed on a wolf proves the claimant; one that landed on a
+//     villager exposes them). Correct reads — votes and accusations that
+//     landed on revealed wolves — are tracked per seat: the doctor protects
+//     the villager with the best reads, the wolves kill them.
+//   - werewolf: kill the most dangerous villager (a proven seer claimant
+//     first, then players whose reads keep landing on wolves, then players
+//     accusing us or our partner), and always agree with the partner's
 //     night vote when the partner voted first — the kill only lands when both
 //     wolves name the same seat. By day, push votes onto the most-suspected
 //     villager and never accuse the partner.
-//   - seer: inspect the most-suspected uninspected seat; announce a found wolf
-//     at once, naming the seat.
-//   - doctor: protect the seer claimant when there is one, else the most active
-//     villager (the likeliest wolf target), never repeating last night's seat.
-//   - villager: accuse and vote the most-suspected seat.
-// Statements come from short deterministic templates, picked by a seeded RNG
-// over (trial seed, game, day, round), so the same trial always says the same
-// thing at the same table.
+//   - seer: inspect the most-suspected uninspected seat (an unverified seer
+//     claimant first, to settle the claim); announce a found wolf at once,
+//     counter-claim a liar with our own results, and defend a seat our
+//     results prove clear when the village pushes on them.
+//   - doctor: protect the seer claimant when there is one, else the villager
+//     whose reads are most dangerous to the wolves, never a claimant our
+//     results expose as a liar, never repeating last night's seat.
+//   - villager: accuse and vote the most-suspected seat, joining the
+//     village's tally when suspicion is close — an exile needs a plurality,
+//     and a split vote ties and exiles nobody.
+// Statements come from round-dependent deterministic templates, picked by a
+// seeded RNG over (trial seed, game, day, speech count), so the same trial
+// always says the same thing at the same table — but never the same sentence
+// twice in a game.
 
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -134,6 +144,12 @@ interface Analysis {
   knownClear: Set<Seat>;
   /** Seer claims made in speeches, by claimant. */
   claims: Claim[];
+  /** Votes each seat cast for a seat later revealed a wolf (correct reads). */
+  correctVotes: Map<Seat, number>;
+  /** Accusations each seat made against a seat later revealed a wolf. */
+  correctAccusations: Map<Seat, number>;
+  /** Seer-claim verification per claimant: 'proven' (a wolf call hit a wolf), 'disproven' (a wolf call hit a villager, or a clear call hit a wolf), 'unverified'. */
+  claimStatus: Map<Seat, 'proven' | 'disproven' | 'unverified'>;
   /** How many accusations each seat made against each other seat. */
   accusations: Map<Seat, Map<Seat, number>>;
   /** How many times each seat was accused. */
@@ -160,14 +176,20 @@ function parseSpeech(text: string, nameToSeat: Map<string, Seat>): { accused: Se
     const out: Seat[] = [];
     let m: RegExpExecArray | null;
     const rx = new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`);
+    // Seats are 0..7 in this competition (8 players); accept only seats that
+    // actually exist at the table — a stale "seat 0 is a werewolf" used to be
+    // dropped entirely, and seat 0 is a real seat.
+    const valid = new Set(nameToSeat.values());
     while ((m = rx.exec(lower)) !== null) {
       const s = Number(m[1]);
-      if (Number.isInteger(s) && s >= 1 && s <= 8) out.push(s);
+      if (Number.isInteger(s) && valid.has(s)) out.push(s);
     }
     return out;
   };
   for (const s of bySeat(/seat\s+(\d+)\s+is\s+(?:a\s+)?werewolf/g)) accused.add(s);
   for (const s of bySeat(/seat\s+(\d+)\s+is\s+the\s+wolf/g)) accused.add(s);
+  for (const s of bySeat(/seat\s+(\d+)\s+is\s+lying/g)) accused.add(s);
+  for (const s of bySeat(/seat\s+(\d+)\s+is\s+(?:a\s+)?fake\s+seer/g)) accused.add(s);
   for (const s of bySeat(/vote\s+seat\s+(\d+)/g)) accused.add(s);
   for (const s of bySeat(/checked\s+seat\s+(\d+)[^.]*werewolf/g)) accused.add(s);
   for (const s of bySeat(/seat\s+(\d+)\s+is\s+not\s+(?:a\s+)?werewolf/g)) defended.add(s);
@@ -203,6 +225,8 @@ export function analyze(view: View): Analysis {
   const suspicion = new Map<Seat, number>();
   for (const p of view.players) if (p.alive) suspicion.set(p.seat, 0);
   const claims: Claim[] = [];
+  const correctVotes = new Map<Seat, number>();
+  const correctAccusations = new Map<Seat, number>();
   const accusations = new Map<Seat, Map<Seat, number>>();
   const accusedCount = new Map<Seat, number>();
   const speeches = new Map<Seat, number>();
@@ -227,6 +251,7 @@ export function analyze(view: View): Analysis {
         accusedCount.set(t, (accusedCount.get(t) ?? 0) + 1);
         if (knownClear.has(t)) bump(e.seat, 8); // accused a proven villager
         else if (knownWolf.has(t)) bump(e.seat, -12); // accused a proven wolf
+        if (knownWolf.has(t)) correctAccusations.set(e.seat, (correctAccusations.get(e.seat) ?? 0) + 1);
       }
       for (const t of parsed.defended) {
         if (knownWolf.has(t)) bump(e.seat, 10); // defended a proven wolf
@@ -240,6 +265,7 @@ export function analyze(view: View): Analysis {
         if (knownClear.has(target)) bump(e.seat, 15); // voted to exile a proven villager
         else if (knownWolf.has(target)) bump(e.seat, -20); // voted to exile a proven wolf
       }
+      if (target !== null && knownWolf.has(target)) correctVotes.set(e.seat, (correctVotes.get(e.seat) ?? 0) + 1);
     }
   }
 
@@ -251,6 +277,16 @@ export function analyze(view: View): Analysis {
       else if (knownWolf.has(c.wolf)) bump(c.claimant, -30);
     }
     if (c.clear !== null && knownWolf.has(c.clear)) bump(c.claimant, 25);
+  }
+  // Claim verification: a wolf call that landed on a wolf proves the
+  // claimant; a wolf call that landed on a villager (or a clear call that
+  // landed on a wolf) exposes them. Everything else stays unverified.
+  const claimStatus = new Map<Seat, 'proven' | 'disproven' | 'unverified'>();
+  for (const c of claims) {
+    if (claimStatus.get(c.claimant) === 'proven') continue;
+    if (c.wolf !== null && knownWolf.has(c.wolf)) claimStatus.set(c.claimant, 'proven');
+    else if ((c.wolf !== null && knownClear.has(c.wolf)) || (c.clear !== null && knownWolf.has(c.clear))) claimStatus.set(c.claimant, 'disproven');
+    else if (!claimStatus.has(c.claimant)) claimStatus.set(c.claimant, 'unverified');
   }
   // Two seer claimants cannot both be right. When I am the seer, every other
   // claimant is lying; otherwise the claimants split the doubt.
@@ -264,7 +300,7 @@ export function analyze(view: View): Analysis {
   // A seat our own seer results prove is a wolf outranks every heuristic.
   for (const s of knownWolf) if (suspicion.has(s)) suspicion.set(s, 1000);
 
-  return { suspicion, knownWolf, knownClear, claims, accusations, accusedCount, speeches, votes, tallyToday, nameToSeat };
+  return { suspicion, knownWolf, knownClear, claims, correctVotes, correctAccusations, claimStatus, accusations, accusedCount, speeches, votes, tallyToday, nameToSeat };
 }
 
 /** Living seats, in seat order. */
@@ -305,7 +341,12 @@ export function chooseVote(view: View, a: Analysis, seed: string, game: number):
     const voted = candidates.filter((s) => (a.tallyToday.get(s) ?? 0) > 0);
     if (voted.length > 0) return bestOf(voted, (s) => a.tallyToday.get(s) ?? 0, rng);
   }
-  return bestOf(candidates, (s) => a.suspicion.get(s) ?? 0, rng);
+  // Vote concentration: an exile needs a plurality, and a split vote ties and
+  // exiles nobody — which is what the wolves want. So a seat the village is
+  // already converging on gets a bonus, larger for villagers (who need the
+  // exile) than for wolves (who still want a villager exiled, but quietly).
+  const tallyWeight = view.you.role === 'werewolf' ? 6 : 12;
+  return bestOf(candidates, (s) => (a.suspicion.get(s) ?? 0) + tallyWeight * (a.tallyToday.get(s) ?? 0), rng);
 }
 
 /** The night kill, as a werewolf. */
@@ -321,8 +362,16 @@ export function chooseKill(view: View, a: Analysis, seed: string, game: number, 
   const rng = rngFor(seed, `kill:${game}:${view.day}`);
   const seerClaimants = new Set(a.claims.map((c) => c.claimant));
   const accusedMe = (s: Seat): boolean => (a.accusations.get(s)?.get(me) ?? 0) > 0 || (partner !== null && (a.accusations.get(s)?.get(partner) ?? 0) > 0);
+  // A seer claimant whose call already proved true is the most dangerous
+  // villager alive; an unverified claimant is still worth killing; a
+  // contradicted claimant is harmless (and a useful distraction). Next most
+  // dangerous are players whose reads keep landing on wolves — they will
+  // find us next — then players accusing us or our partner.
   const danger = (s: Seat): number =>
-    (seerClaimants.has(s) ? 100 : 0) + (accusedMe(s) ? 25 : 0) + (a.speeches.get(s) ?? 0) * 1 + (a.accusations.get(s)?.size ?? 0) * 2;
+    (a.claimStatus.get(s) === 'proven' ? 120 : a.claimStatus.get(s) === 'unverified' && seerClaimants.has(s) ? 60 : 0) +
+    (accusedMe(s) ? 25 : 0) +
+    (a.correctVotes.get(s) ?? 0) * 20 + (a.correctAccusations.get(s) ?? 0) * 10 +
+    (a.speeches.get(s) ?? 0) * 1 + (a.accusations.get(s)?.size ?? 0) * 2;
   const candidates = options.filter((s) => s !== me && s !== partner);
   if (candidates.length === 0) return null;
   return bestOf(candidates, danger, rng);
@@ -332,9 +381,19 @@ export function chooseKill(view: View, a: Analysis, seed: string, game: number, 
 export function chooseProtect(view: View, a: Analysis, seed: string, game: number, options: Seat[]): Seat | null {
   if (options.length === 0) return null;
   const rng = rngFor(seed, `protect:${game}:${view.day}`);
-  const seerClaimants = new Set(a.claims.map((c) => c.claimant));
-  const value = (s: Seat): number =>
-    (seerClaimants.has(s) ? 100 : 0) + (a.speeches.get(s) ?? 0) * 1 + (a.accusations.get(s)?.size ?? 0) * 3 + (a.accusedCount.get(s) ?? 0) * 0.5;
+  // The wolves kill the villager most dangerous to them: a seer claimant
+  // whose claim still stands, then a player whose reads keep landing on
+  // wolves. Protect that profile — but never a claimant our own results
+  // expose as a liar, and never (as the seer) a rival claimant: they lie.
+  const value = (s: Seat): number => {
+    let v = 0;
+    const status = a.claimStatus.get(s);
+    if (status === 'proven') v += 120;
+    else if (status === 'unverified' && (view.you.role !== 'seer' || s === view.you.seat)) v += 60;
+    v += (a.correctVotes.get(s) ?? 0) * 25 + (a.correctAccusations.get(s) ?? 0) * 15;
+    v += (a.speeches.get(s) ?? 0) * 1 + (a.accusations.get(s)?.size ?? 0) * 3 + (a.accusedCount.get(s) ?? 0) * 0.5;
+    return v;
+  };
   return bestOf(options, value, rng);
 }
 
@@ -345,7 +404,9 @@ export function chooseInspect(view: View, a: Analysis, seed: string, game: numbe
   const inspected = new Set((view.seerResults ?? []).map((r) => r.seat));
   let candidates = options.filter((s) => !inspected.has(s));
   if (candidates.length === 0) candidates = options;
-  return bestOf(candidates, (s) => a.suspicion.get(s) ?? 0, rng);
+  // As the seer, an unverified seer claimant is worth checking: finding a
+  // wolf there exposes the fake claim, and finding a villager settles it.
+  return bestOf(candidates, (s) => (a.suspicion.get(s) ?? 0) + (view.you.role === 'seer' && a.claimStatus.get(s) === 'unverified' ? 50 : 0), rng);
 }
 
 // ---------------------------------------------------------------- statements
@@ -363,6 +424,14 @@ function reasonFor(view: View, a: Analysis, seat: Seat): string {
   }
   const n = a.accusedCount.get(seat) ?? 0;
   if (n >= 2) return 'more than one of us has already pointed at them';
+  // A seat whose votes keep landing on revealed villagers is doing the wolves' work.
+  let villagerVotes = 0;
+  for (const p of view.players) {
+    if (p.role !== null && VILLAGE_ROLES.has(p.role) && a.votes.some((v) => v.voter === seat && v.target === p.seat)) villagerVotes += 1;
+  }
+  if (villagerVotes >= 2) return `they have voted to exile ${villagerVotes} villagers who turned out innocent`;
+  const accusedSeats = a.accusations.get(seat);
+  if (accusedSeats !== undefined && accusedSeats.size >= 3) return 'they keep changing their story, pointing at someone new every day';
   if ((a.speeches.get(seat) ?? 0) === 0) return 'they have said almost nothing while the village talks';
   return 'their story does not add up';
 }
@@ -374,8 +443,10 @@ export function chooseSpeak(view: View, a: Analysis, seed: string, game: number)
   const me = view.you.seat;
   const role = view.you.role;
   const partner = view.you.partner?.seat ?? null;
-  const rng = rngFor(seed, `speak:${game}:${view.day}:${view.log.filter((e) => e.kind === 'speech' || e.kind === 'pass').length}`);
+  const speechesToday = view.log.filter((e) => e.day === view.day && (e.kind === 'speech' || e.kind === 'pass')).length;
+  const rng = rngFor(seed, `speak:${game}:${view.day}:${speechesToday}`);
   const target = chooseVote(view, a, seed, game);
+  const cap = (s: string): string => `${s[0]!.toUpperCase()}${s.slice(1)}`;
 
   // As the seer with a found wolf alive, say so at once: the village needs it.
   if (role === 'seer') {
@@ -384,11 +455,35 @@ export function chooseSpeak(view: View, a: Analysis, seed: string, game: number)
       const s = found[0]!;
       return `I am the seer. I checked seat ${s} (${nameOf(view, s)}) last night and they are a werewolf. Vote seat ${s} out today.`;
     }
+    // Counter-claim: another claimant named a seat our own results prove
+    // clear, or named a proven wolf as clear — they are lying about being
+    // the seer, and the village must hear it from the real one.
+    for (const c of a.claims) {
+      if (c.claimant === me) continue;
+      const contradicts =
+        (c.wolf !== null && (view.seerResults ?? []).some((r) => r.seat === c.wolf && !r.werewolf)) ||
+        (c.clear !== null && (view.seerResults ?? []).some((r) => r.seat === c.clear && r.werewolf));
+      if (!contradicts) continue;
+      const named = c.wolf ?? c.clear!;
+      const verdict = c.wolf !== null ? 'they are not a werewolf' : 'they are a werewolf';
+      return `I am the real seer. Seat ${c.claimant} is lying — I checked seat ${named} (${nameOf(view, named)}) last night and ${verdict}. Do not follow seat ${c.claimant}.`;
+    }
+    // Defend a seat our own results prove clear when the village is pushing
+    // on them: a wasted exile today can lose the game.
+    for (const s of living(view)) {
+      if (s === me || !a.knownClear.has(s)) continue;
+      if ((a.tallyToday.get(s) ?? 0) > 0 || (a.accusedCount.get(s) ?? 0) >= 2) {
+        return target !== null && target !== s
+          ? `I checked seat ${s} (${nameOf(view, s)}) last night and they are not a wolf. Do not waste today's vote on them — look at seat ${target} (${nameOf(view, target)}) instead.`
+          : `I checked seat ${s} (${nameOf(view, s)}) last night and they are not a wolf. Do not waste today's vote on them.`;
+      }
+    }
   }
-  // A claimant's wolf call we have no reason to doubt is worth backing.
+  // A claimant's wolf call we have no reason to doubt is worth backing —
+  // but never one our analysis already exposed as a liar.
   if (role !== 'werewolf') {
     for (const c of a.claims) {
-      if (c.wolf !== null && living(view).includes(c.wolf) && !a.knownClear.has(c.wolf) && c.claimant !== me) {
+      if (c.wolf !== null && living(view).includes(c.wolf) && !a.knownClear.has(c.wolf) && c.claimant !== me && a.claimStatus.get(c.claimant) !== 'disproven') {
         const claimant = c.claimant;
         // Do not back a claimant our own results contradict.
         if (role === 'seer' && (view.seerResults ?? []).some((r) => r.seat === c.wolf && !r.werewolf)) continue;
@@ -399,29 +494,59 @@ export function chooseSpeak(view: View, a: Analysis, seed: string, game: number)
   // Pushed on hard, defend once and turn it back on the accuser's favourite target.
   const pushedOn = (a.accusedCount.get(me) ?? 0) >= 2;
   if (pushedOn && target !== null) {
-    return `I am not a wolf. Seat ${target} (${nameOf(view, target)}) is pushing on me to deflect from themself — look at their votes.`;
+    let topAccuser: Seat | null = null;
+    let topN = 0;
+    for (const [s, m] of a.accusations) {
+      const n = m.get(me) ?? 0;
+      if (s !== me && n > topN) {
+        topN = n;
+        topAccuser = s;
+      }
+    }
+    if (topAccuser !== null) {
+      return `I am not a wolf. Seat ${topAccuser} (${nameOf(view, topAccuser)}) keeps pointing at me to deflect from themself — look at seat ${target} (${nameOf(view, target)}) instead.`;
+    }
   }
   if (target === null) return null;
   const reason = reasonFor(view, a, target);
   const name = nameOf(view, target);
-  if (role === 'werewolf') {
-    return pickTemplate(
-      [
-        `Seat ${target} (${name}) is my top suspect: ${reason}. Let's vote seat ${target} out.`,
-        `I have been watching seat ${target} (${name}). ${reason[0]!.toUpperCase()}${reason.slice(1)}. I am voting seat ${target} today.`,
-        `Seat ${target} (${name}) keeps dodging the real question. ${reason[0]!.toUpperCase()}${reason.slice(1)}. Vote seat ${target}.`,
-      ],
-      rng,
-    );
+  // A second accuser of our target, if there is one: agreeing with a real
+  // villager's read looks like a villager, not a wolf driving a wagon.
+  let backer: Seat | null = null;
+  for (const [s, m] of a.accusations) {
+    if (s !== me && (m.get(target) ?? 0) > 0) {
+      backer = s;
+      break;
+    }
   }
-  return pickTemplate(
-    [
-      `Seat ${target} (${name}) is my top suspect: ${reason}. Let's vote seat ${target} out.`,
-      `The evidence points at seat ${target} (${name}) — ${reason}. I am voting seat ${target} today.`,
-      `Seat ${target} (${name}) looks worst to me: ${reason}. Vote seat ${target}.`,
-    ],
-    rng,
-  );
+  // Round 1 is for opening reads and questions; round 2 is for pushing the
+  // vote with evidence. Same facts, different shape, so the table never
+  // hears the same sentence twice in a game.
+  const early = speechesToday < living(view).length;
+  if (early) {
+    const templates = [
+      `Seat ${target} (${name}) worries me most so far: ${reason}. What do the rest of you think?`,
+      `I am still listening, but seat ${target} (${name}) stands out — ${reason}.`,
+      `Has anyone else noticed seat ${target} (${name})? ${cap(reason)}.`,
+    ];
+    if (role === 'werewolf') {
+      templates.push(`I am not certain yet, but seat ${target} (${name}) does not sit right with me — ${reason}.`);
+    }
+    return pickTemplate(templates, rng);
+  }
+  const templates = [
+    `Seat ${target} (${name}) is my top suspect: ${reason}. Let's vote seat ${target} out.`,
+    `The evidence points at seat ${target} (${name}) — ${reason}. I am voting seat ${target} today.`,
+    `Seat ${target} (${name}) looks worst to me: ${reason}. Vote seat ${target}.`,
+    `I have gone back over the day and I keep landing on seat ${target} (${name}): ${reason}. Vote seat ${target}.`,
+  ];
+  if (backer !== null) {
+    templates.push(`I agree with what seat ${backer} said earlier — seat ${target} (${name}) is the one to watch: ${reason}.`);
+  }
+  if (role === 'werewolf') {
+    templates.push(`I have been watching seat ${target} (${name}). ${cap(reason)}. I am voting seat ${target} today.`);
+  }
+  return pickTemplate(templates, rng);
 }
 
 // ---------------------------------------------------------------- the run
